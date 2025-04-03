@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Mobile AR Video Overlay</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            touch-action: none;
+            background-color: #000;
+            position: fixed;
+            width: 100%;
+            height: 100%;
+        }
+        
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            touch-action: none;
+        }
+        
+        #status {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 12px 16px;
+            border-radius: 8px;
+            z-index: 100;
+            font-size: 14px;
+            max-width: 80%;
+            backdrop-filter: blur(5px);
+            -webkit-backdrop-filter: blur(5px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        #loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            color: white;
+        }
+        
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+            margin-bottom: 20px;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        #controls {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .control-btn {
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 24px;
+            cursor: pointer;
+            backdrop-filter: blur(5px);
+            -webkit-backdrop-filter: blur(5px);
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+        
+        #videoElement {
+            display: none;
+        }
+        
+        #debug {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 5px;
+            font-size: 12px;
+            z-index: 1000;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div>Loading AR Experience...</div>
+    </div>
+    
+    <canvas id="canvas"></canvas>
+    <div id="status">Waiting for camera access...</div>
+    <div id="debug"></div>
+    
+    <div id="controls">
+        <button id="switchCamera" class="control-btn hidden">⟲</button>
+        <button id="toggleFlash" class="control-btn hidden">⚡</button>
+    </div>
+    
+    <video id="videoElement" loop crossorigin="anonymous" playsinline muted>
+        <source src="videos/your-video-file.mp4" type="video/mp4">
+    </video>
+    
+    <!-- Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-aruco/3.0.0/aruco.min.js"></script>
+
+    <script>
+        // App configuration
+        const config = {
+            debug: false,                // Enable/disable debug information
+            markerSize: 0.1,             // Marker size in meters
+            videoScale: 1.5,             // Scale of video relative to marker
+            processingInterval: 16,      // Frame processing interval in ms (60fps)
+            maxDetectionAttempts: 300,   // Max attempts before showing help (5 seconds at 60fps)
+            preferredCameraFacing: 'environment'  // 'environment' or 'user'
+        };
+        
+        // Global variables
+        let scene, camera, renderer;
+        let videoTexture, videoMaterial, videoScreen;
+        let videoElement, canvasElement, statusElement, debugElement;
+        let canvasWidth, canvasHeight;
+        let markerFound = false;
+        let videoStream = null;
+        let processingCanvas, processingContext;
+        let detector;
+        let detectionAttempts = 0;
+        let isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        let isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+        let availableCameras = [];
+        let currentCameraIndex = 0;
+        let flashAvailable = false;
+        let track = null;
+        
+        // Initialize the application
+        async function init() {
+            // Get DOM elements
+            videoElement = document.getElementById('videoElement');
+            canvasElement = document.getElementById('canvas');
+            statusElement = document.getElementById('status');
+            debugElement = document.getElementById('debug');
+            
+            if (config.debug) {
+                debugElement.style.display = 'block';
+            }
+            
+            // Create processing canvas for marker detection
+            processingCanvas = document.createElement('canvas');
+            processingContext = processingCanvas.getContext('2d', { willReadFrequently: true });
+            
+            try {
+                // Check for camera support
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error("Your browser doesn't support camera access");
+                }
+                
+                // Setup device camera and initialize AR
+                await setupCamera();
+                
+                // Setup Three.js scene
+                setupThreeJS();
+                
+                // Initialize Aruco detector
+                detector = new aruco.Detector();
+                
+                // Start processing video frames
+                startVideoProcessing();
+                
+                // Start animation loop
+                animate();
+                
+                // Setup event listeners
+                setupEventListeners();
+                
+                // Hide loading screen
+                document.getElementById('loading').classList.add('hidden');
+                
+                statusElement.textContent = "Point camera at marker image";
+            } catch (error) {
+                document.getElementById('loading').classList.add('hidden');
+                statusElement.textContent = "Error: " + error.message;
+                console.error(error);
+            }
+        }
+        
+        // Get available cameras and set up the video stream
+        async function setupCamera() {
+            try {
+                // Get list of available video devices
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                availableCameras = devices.filter(device => device.kind === 'videoinput');
+                
+                if (availableCameras.length === 0) {
+                    throw new Error("No camera found");
+                }
+                
+                // Show camera switch button if multiple cameras available
+                if (availableCameras.length > 1) {
+                    document.getElementById('switchCamera').classList.remove('hidden');
+                }
+                
+                // Find back camera for mobile devices
+                if (isMobile && config.preferredCameraFacing === 'environment') {
+                    const backCameraIndex = availableCameras.findIndex(
+                        camera => camera.label.toLowerCase().includes('back') || 
+                               camera.label.toLowerCase().includes('rear') ||
+                               camera.label.toLowerCase().includes('environment')
+                    );
+                    
+                    if (backCameraIndex !== -1) {
+                        currentCameraIndex = backCameraIndex;
+                    }
+                }
+                
+                await startCamera();
+                
+                // Update status
+                statusElement.textContent = "Camera ready, looking for marker...";
+                
+            } catch (error) {
+                throw new Error("Camera setup failed: " + error.message);
+            }
+        }
+        
+        // Start the selected camera
+        async function startCamera() {
+            // Stop any existing stream
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+            
+            // Camera constraints
+            const constraints = {
+                video: {
+                    facingMode: config.preferredCameraFacing,
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                },
+                audio: false
+            };
+            
+            // Use deviceId if available
+            if (availableCameras.length > 0) {
+                constraints.video.deviceId = { exact: availableCameras[currentCameraIndex].deviceId };
+                delete constraints.video.facingMode;
+            }
+            
+            try {
+                // Get camera stream
+                videoStream = await navigator.mediaDevices.getUserMedia(constraints);
+                
+                // Check if flash is available
+                track = videoStream.getVideoTracks()[0];
+                const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+                flashAvailable = !!capabilities.torch;
+                
+                if (flashAvailable) {
+                    document.getElementById('toggleFlash').classList.remove('hidden');
+                }
+                
+                // Connect stream to video element
+                videoElement.srcObject = videoStream;
+                
+                // Need to play the video for Safari on iOS
+                videoElement.play();
+                
+                return new Promise((resolve) => {
+                    videoElement.onloadedmetadata = () => {
+                        // Set processing canvas dimensions
+                        processingCanvas.width = videoElement.videoWidth;
+                        processingCanvas.height = videoElement.videoHeight;
+                        
+                        if (config.debug) {
+                            debugElement.textContent = `Camera: ${videoElement.videoWidth}x${videoElement.videoHeight}`;
+                        }
+                        
+                        resolve();
+                    };
+                });
+            } catch (error) {
+                throw new Error("Could not access camera: " + error.message);
+            }
+        }
+        
+        // Setup ThreeJS scene
+        function setupThreeJS() {
+            // Create scene
+            scene = new THREE.Scene();
+            
+            // Create camera
+            canvasWidth = window.innerWidth;
+            canvasHeight = window.innerHeight;
+            camera = new THREE.PerspectiveCamera(75, canvasWidth / canvasHeight, 0.1, 1000);
+            camera.position.z = 5;
+            
+            // Create renderer
+            renderer = new THREE.WebGLRenderer({ 
+                canvas: canvasElement,
+                antialias: true,
+                alpha: true,
+                powerPreference: "high-performance"
+            });
+            renderer.setSize(canvasWidth, canvasHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            
+            // Create video texture
+            videoTexture = new THREE.VideoTexture(videoElement);
+            videoTexture.minFilter = THREE.LinearFilter;
+            videoTexture.magFilter = THREE.LinearFilter;
+            
+            // Create video material
+            videoMaterial = new THREE.MeshBasicMaterial({ 
+                map: videoTexture,
+                side: THREE.DoubleSide,
+                transparent: true
+            });
+            
+            // Create video screen (plane)
+            const aspect = 16/9; // Assuming 16:9 video, adjust if needed
+            const videoGeometry = new THREE.PlaneGeometry(aspect, 1);
+            videoScreen = new THREE.Mesh(videoGeometry, videoMaterial);
+            
+            // Add to scene but hide initially
+            videoScreen.visible = false;
+            scene.add(videoScreen);
+        }
+        
+        // Start processing video frames for marker detection
+        function startVideoProcessing() {
+            // Start the interval for processing frames
+            setInterval(() => {
+                if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+                    // Draw video frame to canvas
+                    processingContext.drawImage(
+                        videoElement, 
+                        0, 0, 
+                        processingCanvas.width, processingCanvas.height
+                    );
+                    
+                    // Get image data for processing
+                    const imageData = processingContext.getImageData(
+                        0, 0, 
+                        processingCanvas.width, processingCanvas.height
+                    );
+                    
+                    // Detect markers
+                    try {
+                        const markers = detector.detect(imageData);
+                        
+                        if (markers.length > 0) {
+                            if (!markerFound) {
+                                statusElement.textContent = "Marker found! Playing video...";
+                                markerFound = true;
+                                detectionAttempts = 0;
+                                
+                                // Show video and play it
+                                videoScreen.visible = true;
+                                videoElement.play().catch(err => {
+                                    console.error("Video play error:", err);
+                                    statusElement.textContent = "Video playback error. Tap screen to try again.";
+                                });
+                            }
+                            
+                            // Update video position based on marker
+                            updateVideoPosition(markers[0]);
+                            
+                        } else {
+                            if (markerFound) {
+                                // Marker lost
+                                markerFound = false;
+                                videoScreen.visible = false;
+                                videoElement.pause();
+                                statusElement.textContent = "Marker lost. Keep scanning...";
+                            } else {
+                                // Still searching
+                                detectionAttempts++;
+                                if (detectionAttempts >= config.maxDetectionAttempts && 
+                                    statusElement.textContent !== "Try moving camera slowly around marker") {
+                                    statusElement.textContent = "Try moving camera slowly around marker";
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        // Handle detection errors silently
+                        if (config.debug) {
+                            console.error("Detection error:", e);
+                        }
+                    }
+                }
+            }, config.processingInterval);
+        }
+        
+        // Update video position based on marker
+        function updateVideoPosition(marker) {
+            // Get marker center and corners
+            const center = marker.center;
+            const corners = marker.corners;
+            
+            // Calculate position in normalized device coordinates (-1 to 1)
+            const ndcX = ((center.x / processingCanvas.width) * 2 - 1) * -1; // Flip for mirroring if needed
+            const ndcY = ((center.y / processingCanvas.height) * 2 - 1) * -1;
+            
+            // Calculate rotation based on marker orientation
+            const dx = corners[1].x - corners[0].x;
+            const dy = corners[1].y - corners[0].y;
+            const angle = Math.atan2(dy, dx);
+            
+            // Calculate scale based on marker size
+            const width = Math.hypot(
+                corners[0].x - corners[1].x,
+                corners[0].y - corners[1].y
+            );
+            const size = (width / processingCanvas.width) * config.videoScale;
+            
+            // Update video plane position and rotation
+            videoScreen.position.set(ndcX * 3, ndcY * 2, 0);
+            videoScreen.rotation.z = angle;
+            videoScreen.scale.set(size, size, size);
+            
+            if (config.debug) {
+                debugElement.textContent = `Marker at: ${center.x.toFixed(0)},${center.y.toFixed(0)} | Scale: ${size.toFixed(2)}`;
+            }
+        }
+        
+        // Handle window resize
+        function onWindowResize() {
+            canvasWidth = window.innerWidth;
+            canvasHeight = window.innerHeight;
+            camera.aspect = canvasWidth / canvasHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(canvasWidth, canvasHeight);
+        }
+        
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
+                videoTexture.needsUpdate = true;
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        // Setup event listeners
+        function setupEventListeners() {
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize, false);
+            
+            // Handle camera switching
+            document.getElementById('switchCamera').addEventListener('click', async () => {
+                if (availableCameras.length <= 1) return;
+                
+                currentCameraIndex = (currentCameraIndex + 1) % availableCameras.length;
+                statusElement.textContent = "Switching camera...";
+                
+                try {
+                    await startCamera();
+                    statusElement.textContent = "Camera switched, looking for marker...";
+                } catch (error) {
+                    statusElement.textContent = "Camera switch failed: " + error.message;
+                }
+            });
+            
+            // Handle flash toggle
+            document.getElementById('toggleFlash').addEventListener('click', async () => {
+                if (!flashAvailable || !track) return;
+                
+                try {
+                    const flashOn = await track.getConstraints().advanced?.[0]?.torch || false;
+                    await track.applyConstraints({
+                        advanced: [{ torch: !flashOn }]
+                    });
+                    
+                    document.getElementById('toggleFlash').style.opacity = !flashOn ? '1' : '0.5';
+                } catch (error) {
+                    console.error("Flash toggle failed:", error);
+                }
+            });
+            
+            // Handle screen tap (iOS sometimes needs this to start video playback)
+            canvasElement.addEventListener('click', () => {
+                if (markerFound) {
+                    videoElement.play().catch(err => {
+                        console.error("Video play error on tap:", err);
+                    });
+                }
+            });
+            
+            // Prevent pinch zoom
+            document.addEventListener('touchmove', function(event) {
+                if (event.touches.length > 1) {
+                    event.preventDefault();
+                }
+            }, { passive: false });
+        }
+        
+        // Start the application
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>
